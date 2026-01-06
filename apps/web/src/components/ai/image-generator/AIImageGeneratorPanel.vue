@@ -9,7 +9,7 @@ import {
   Settings,
   Trash2,
 } from 'lucide-vue-next'
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -18,13 +18,16 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import useAIImageConfigStore from '@/stores/aiImageConfig'
 import { useEditorStore } from '@/stores/editor'
+import useGeminiImageConfigStore from '@/stores/geminiImageConfig'
 import { useUIStore } from '@/stores/ui'
 import { copyPlain } from '@/utils/clipboard'
 import { store } from '@/utils/storage'
 import AIImageConfig from './AIImageConfig.vue'
+import AIImageGeminiConfig from './AIImageGeminiConfig.vue'
 
 /* ---------- 组件属性 ---------- */
 const props = defineProps<{ open: boolean }>()
@@ -40,9 +43,8 @@ const { toggleAIDialog } = uiStore
 const dialogVisible = ref(props.open)
 watch(() => props.open, (val) => {
   dialogVisible.value = val
-  // 每次打开面板时检查并清理过期图片
   if (val) {
-    cleanExpiredImages()
+    initializeImages()
   }
 })
 watch(dialogVisible, val => emit(`update:open`, val))
@@ -57,125 +59,259 @@ const imagePrompts = ref<string[]>([]) // 存储每张图片对应的prompt
 const imageTimestamps = ref<number[]>([]) // 存储每张图片的生成时间戳
 const abortController = ref<AbortController | null>(null)
 const currentImageIndex = ref(0)
-const timeUpdateInterval = ref<NodeJS.Timeout | null>(null)
+const generateRounds = ref(1)
+const imagesPerRound = ref(1)
+const historyDates = ref<string[]>([])
+const selectedDate = ref<string>(``)
+const historyLoading = ref(false)
+const historyError = ref<string>(``)
+const generateError = ref<string>(``)
+
+const maxGenerateRounds = 3
+const maxImagesPerRound = 4
+const maxTotalImages = 12
+
+const totalPlannedImages = computed(() => generateRounds.value * imagesPerRound.value)
+const hasImages = computed(() => generatedImages.value.length > 0)
+
+function clampGenerationSettings() {
+  generateRounds.value = Math.min(Math.max(generateRounds.value, 1), maxGenerateRounds)
+  imagesPerRound.value = Math.min(Math.max(imagesPerRound.value, 1), maxImagesPerRound)
+
+  const total = generateRounds.value * imagesPerRound.value
+  if (total > maxTotalImages) {
+    const allowedPerRound = Math.max(1, Math.floor(maxTotalImages / generateRounds.value))
+    imagesPerRound.value = Math.min(imagesPerRound.value, allowedPerRound)
+  }
+}
+
+watch([generateRounds, imagesPerRound], () => {
+  clampGenerationSettings()
+})
 
 /* ---------- AI 配置 ---------- */
 const AIImageConfigStore = useAIImageConfigStore()
 const { apiKey, endpoint, model, type, size, quality, style } = storeToRefs(AIImageConfigStore)
+const geminiImageConfigStore = useGeminiImageConfigStore()
+const {
+  enabled: geminiEnabled,
+  endpoint: geminiEndpoint,
+  model: geminiModel,
+  apiKey: geminiApiKey,
+} = storeToRefs(geminiImageConfigStore)
 
-/* ---------- 过期检查函数 ---------- */
-function isImageExpired(timestamp: number): boolean {
-  const EXPIRY_TIME = 60 * 60 * 1000 // 1小时，单位毫秒
-  const now = Date.now()
-  return now - timestamp > EXPIRY_TIME
-}
+async function resolveGeminiOssConfig() {
+  const config = await store.getJSON(`aliOSSConfig`, null)
+  if (!config) {
+    return null
+  }
+  const {
+    region,
+    bucket,
+    accessKeyId,
+    accessKeySecret,
+    useSSL,
+    cdnHost,
+    path,
+  } = config
 
-async function cleanExpiredImages() {
-  const savedImages = await store.get(`ai_generated_images`)
-  const savedTimestamps = await store.get(`ai_image_timestamps`)
-
-  if (!savedImages) {
-    return
+  if (!region || !bucket || !accessKeyId || !accessKeySecret) {
+    return null
   }
 
+  return {
+    region,
+    bucket,
+    accessKeyId,
+    accessKeySecret,
+    useSSL,
+    cdnHost,
+    path,
+  }
+}
+
+function resolveImageRequestConfig() {
+  const headers: Record<string, string> = { 'Content-Type': `application/json` }
+  let endpointValue = endpoint.value
+  let modelValue = model.value
+  let useGemini = false
+
+  if (geminiEnabled.value) {
+    useGemini = true
+    endpointValue = geminiEndpoint.value
+    modelValue = geminiModel.value
+    const key = geminiApiKey.value.trim()
+    if (key) {
+      headers[`x-goog-api-key`] = key
+    }
+  }
+  else if (apiKey.value && type.value !== `default`) {
+    headers.Authorization = `Bearer ${apiKey.value}`
+  }
+
+  if (!endpointValue?.trim() || !modelValue?.trim()) {
+    return null
+  }
+
+  return {
+    headers,
+    endpointValue,
+    modelValue,
+    useGemini,
+  }
+}
+
+function getTodayKey() {
+  const date = new Date()
+  const year = date.getFullYear()
+  const month = `${date.getMonth() + 1}`.padStart(2, `0`)
+  const day = `${date.getDate()}`.padStart(2, `0`)
+  return `${year}-${month}-${day}`
+}
+
+function buildHistoryUrl(dateKey?: string) {
+  const url = new URL(geminiEndpoint.value)
+  url.pathname = `/ai/images`
+  if (dateKey) {
+    url.searchParams.set(`date`, dateKey)
+  }
+  return url
+}
+
+function ensureHistoryDate(dateKey: string) {
+  if (!dateKey) {
+    return
+  }
+  if (!historyDates.value.includes(dateKey)) {
+    historyDates.value = [...historyDates.value, dateKey].sort()
+  }
+}
+
+async function loadLocalImages() {
   const images = await store.getJSON(`ai_generated_images`, [])
   const prompts = await store.getJSON(`ai_image_prompts`, [])
   const timestamps = await store.getJSON(`ai_image_timestamps`, [])
 
-  // 如果没有时间戳数据，说明是旧版本，默认清除所有数据
-  if (!savedTimestamps || timestamps.length === 0) {
-    console.log(`🧹 检测到旧版本数据，清除所有过期图片`)
-    generatedImages.value = []
-    imagePrompts.value = []
-    imageTimestamps.value = []
-    await store.remove(`ai_generated_images`)
-    await store.remove(`ai_image_prompts`)
-    await store.remove(`ai_image_timestamps`)
+  generatedImages.value = Array.isArray(images) ? images : []
+  imagePrompts.value = Array.isArray(prompts) ? prompts : []
+  imageTimestamps.value = Array.isArray(timestamps) ? timestamps : []
+
+  if (generatedImages.value.length < imagePrompts.value.length) {
+    imagePrompts.value = imagePrompts.value.slice(0, generatedImages.value.length)
+  }
+  else if (imagePrompts.value.length < generatedImages.value.length) {
+    imagePrompts.value = [
+      ...imagePrompts.value,
+      ...Array.from({ length: generatedImages.value.length - imagePrompts.value.length }, () => ``),
+    ]
+  }
+
+  if (generatedImages.value.length < imageTimestamps.value.length) {
+    imageTimestamps.value = imageTimestamps.value.slice(0, generatedImages.value.length)
+  }
+  else if (imageTimestamps.value.length < generatedImages.value.length) {
+    imageTimestamps.value = [
+      ...imageTimestamps.value,
+      ...Array.from({ length: generatedImages.value.length - imageTimestamps.value.length }, () => Date.now()),
+    ]
+  }
+
+  currentImageIndex.value = 0
+}
+
+async function fetchHistoryDates() {
+  historyLoading.value = true
+  historyError.value = ``
+  try {
+    const res = await window.fetch(buildHistoryUrl().toString())
+    if (!res.ok) {
+      const errorText = await res.text()
+      throw new Error(`${res.status}: ${errorText}`)
+    }
+    const data = await res.json()
+    const dates = Array.isArray(data?.dates) ? data.dates : []
+    historyDates.value = dates
+
+    const todayKey = getTodayKey()
+    if (!selectedDate.value) {
+      selectedDate.value = dates[dates.length - 1] || todayKey
+    }
+    else if (!dates.includes(selectedDate.value) && selectedDate.value !== todayKey) {
+      selectedDate.value = dates[dates.length - 1] || todayKey
+    }
+  }
+  catch (error) {
+    historyError.value = `历史记录加载失败：${(error as Error).message}`
+  }
+  finally {
+    historyLoading.value = false
+  }
+}
+
+async function fetchHistoryByDate(dateKey: string) {
+  if (!dateKey) {
     return
   }
-
-  // 过滤掉过期的图片
-  const validIndices: number[] = []
-  timestamps.forEach((timestamp: number, index: number) => {
-    if (!isImageExpired(timestamp)) {
-      validIndices.push(index)
+  historyLoading.value = true
+  historyError.value = ``
+  try {
+    const res = await window.fetch(buildHistoryUrl(dateKey).toString())
+    if (!res.ok) {
+      const errorText = await res.text()
+      throw new Error(`${res.status}: ${errorText}`)
     }
-  })
+    const data = await res.json()
+    const items = Array.isArray(data?.items) ? data.items : []
 
-  const validImages = validIndices.map(i => images[i]).filter(Boolean)
-  const validPrompts = validIndices.map(i => prompts[i] || ``).filter((_, index) => validImages[index])
-  const validTimestamps = validIndices.map(i => timestamps[i]).filter(Boolean)
-
-  // 更新数据
-  generatedImages.value = validImages
-  imagePrompts.value = validPrompts
-  imageTimestamps.value = validTimestamps
-
-  // 如果有数据被清除，更新存储
-  if (validImages.length < images.length) {
-    console.log(`🧹 清除了 ${images.length - validImages.length} 张过期图片`)
-    if (validImages.length > 0) {
-      await store.setJSON(`ai_generated_images`, validImages)
-      await store.setJSON(`ai_image_prompts`, validPrompts)
-      await store.setJSON(`ai_image_timestamps`, validTimestamps)
-    }
-    else {
-      await store.remove(`ai_generated_images`)
-      await store.remove(`ai_image_prompts`)
-      await store.remove(`ai_image_timestamps`)
-    }
+    generatedImages.value = items.map((item: any) => item?.url).filter(Boolean)
+    imagePrompts.value = items.map((item: any) => item?.prompt || ``)
+    imageTimestamps.value = items.map((item: any) => {
+      const time = Date.parse(item?.createdAt || ``)
+      return Number.isFinite(time) ? time : Date.now()
+    })
+    currentImageIndex.value = 0
   }
+  catch (error) {
+    historyError.value = `历史记录加载失败：${(error as Error).message}`
+  }
+  finally {
+    historyLoading.value = false
+  }
+}
 
-  console.log(`📊 过期检查完成，有效图片数量:`, validImages.length)
+async function refreshHistoryDates() {
+  if (!geminiEnabled.value) {
+    return
+  }
+  await fetchHistoryDates()
+}
+
+async function initializeImages() {
+  if (geminiEnabled.value) {
+    await refreshHistoryDates()
+  }
+  else {
+    historyDates.value = []
+    selectedDate.value = ``
+    historyError.value = ``
+    await loadLocalImages()
+  }
 }
 
 /* ---------- 初始数据 ---------- */
 onMounted(async () => {
-  // 先进行过期检查和清理
-  await cleanExpiredImages()
-
-  // 确保数组长度一致
-  const imagesLength = generatedImages.value.length
-  const promptsLength = imagePrompts.value.length
-  const timestampsLength = imageTimestamps.value.length
-
-  const maxLength = Math.max(imagesLength, promptsLength, timestampsLength)
-
-  if (imagesLength < maxLength) {
-    // 如果图片少于其他数组，说明数据不一致，清除所有数据
-    console.warn(`⚠️ 数据不一致，清除所有数据`)
-    generatedImages.value = []
-    imagePrompts.value = []
-    imageTimestamps.value = []
-    await store.remove(`ai_generated_images`)
-    await store.remove(`ai_image_prompts`)
-    await store.remove(`ai_image_timestamps`)
-  }
-  else {
-    // 补齐较短的数组
-    if (promptsLength < imagesLength) {
-      imagePrompts.value = [...imagePrompts.value, ...Array.from({ length: imagesLength - promptsLength }, () => ``)]
-    }
-    if (timestampsLength < imagesLength) {
-      imageTimestamps.value = [...imageTimestamps.value, ...Array.from({ length: imagesLength - timestampsLength }, () => Date.now())]
-    }
-  }
-
-  // 启动定时器，每30秒检查一次过期图片并更新时间显示
-  timeUpdateInterval.value = setInterval(() => {
-    // 检查并清理过期图片
-    if (generatedImages.value.length > 0) {
-      cleanExpiredImages()
-    }
-  }, 30000) // 30秒
+  await initializeImages()
 })
 
-onBeforeUnmount(() => {
-  // 清除定时器
-  if (timeUpdateInterval.value) {
-    clearInterval(timeUpdateInterval.value)
-    timeUpdateInterval.value = null
+watch(geminiEnabled, async () => {
+  await initializeImages()
+})
+
+watch(selectedDate, async (dateKey) => {
+  if (!geminiEnabled.value) {
+    return
   }
+  await fetchHistoryByDate(dateKey)
 })
 
 /* ---------- 事件处理 ---------- */
@@ -207,6 +343,9 @@ async function generateImage() {
   if (!prompt.value.trim() || loading.value)
     return
 
+  generateError.value = ``
+  clampGenerationSettings()
+
   // 保存当前提示词用于重新生成
   const currentPrompt = prompt.value.trim()
   lastUsedPrompt.value = currentPrompt
@@ -214,73 +353,112 @@ async function generateImage() {
   loading.value = true
   abortController.value = new AbortController()
 
-  const headers: Record<string, string> = { 'Content-Type': `application/json` }
-  if (apiKey.value && type.value !== `default`)
-    headers.Authorization = `Bearer ${apiKey.value}`
+  const requestConfig = resolveImageRequestConfig()
+  if (!requestConfig) {
+    generateError.value = `配置不完整，请检查 Gemini 配置中的端点和模型设置`
+    loading.value = false
+    abortController.value = null
+    return
+  }
 
   try {
-    const url = new URL(endpoint.value)
+    const url = new URL(requestConfig.endpointValue)
     if (!url.pathname.includes(`/images/`) && !url.pathname.endsWith(`/images/generations`)) {
       url.pathname = url.pathname.replace(/\/?$/, `/images/generations`)
     }
 
-    const payload: any = {
-      model: model.value,
-      prompt: currentPrompt,
-      size: size.value,
-      n: 1,
-    }
+    const newImages: string[] = []
+    const newPrompts: string[] = []
+    const newTimestamps: number[] = []
+    const rounds = generateRounds.value
+    const perRound = imagesPerRound.value
 
-    // 只对 DALL-E 模型添加额外参数
-    if (model.value.includes(`dall-e`)) {
-      payload.quality = quality.value
-      payload.style = style.value
-    }
-
-    const res = await window.fetch(url.toString(), {
-      method: `POST`,
-      headers,
-      body: JSON.stringify(payload),
-      signal: abortController.value.signal,
-    })
-
-    if (!res.ok) {
-      const errorText = await res.text()
-      throw new Error(`${res.status}: ${errorText}`)
-    }
-
-    const data = await res.json()
-
-    if (data.data && data.data.length > 0) {
-      const imageUrl = data.data[0].url || data.data[0].b64_json
-
-      if (imageUrl) {
-        // 如果是 base64 格式，转换为 data URL
-        const finalUrl = imageUrl.startsWith(`data:`) || imageUrl.startsWith(`http`)
-          ? imageUrl
-          : `data:image/png;base64,${imageUrl}`
-
-        const currentTimestamp = Date.now()
-
-        generatedImages.value.unshift(finalUrl)
-        imagePrompts.value.unshift(currentPrompt) // 保存对应的prompt
-        imageTimestamps.value.unshift(currentTimestamp) // 保存生成时间戳
-        currentImageIndex.value = 0
-
-        // 限制存储的图片数量，避免占用过多存储空间
-        if (generatedImages.value.length > 20) {
-          generatedImages.value = generatedImages.value.slice(0, 20)
-          imagePrompts.value = imagePrompts.value.slice(0, 20)
-          imageTimestamps.value = imageTimestamps.value.slice(0, 20)
-        }
-
-        await store.setJSON(`ai_generated_images`, generatedImages.value)
-        await store.setJSON(`ai_image_prompts`, imagePrompts.value)
-        await store.setJSON(`ai_image_timestamps`, imageTimestamps.value)
-
-        // 清空输入框
-        prompt.value = ``
+    for (let round = 0; round < rounds; round++) {
+      if (abortController.value?.signal.aborted) {
+        break
       }
+
+      const payload: any = {
+        model: requestConfig.modelValue,
+        prompt: currentPrompt,
+        size: size.value,
+        n: perRound,
+      }
+
+      if (requestConfig.useGemini) {
+        const ossConfig = await resolveGeminiOssConfig()
+        if (ossConfig) {
+          payload.ossConfig = ossConfig
+        }
+      }
+
+      // 只对 DALL-E 模型添加额外参数
+      if (!requestConfig.useGemini && requestConfig.modelValue.includes(`dall-e`)) {
+        payload.quality = quality.value
+        payload.style = style.value
+      }
+
+      const res = await window.fetch(url.toString(), {
+        method: `POST`,
+        headers: requestConfig.headers,
+        body: JSON.stringify(payload),
+        signal: abortController.value.signal,
+      })
+
+      if (!res.ok) {
+        const errorText = await res.text()
+        throw new Error(`${res.status}: ${errorText}`)
+      }
+
+      const data = await res.json()
+
+      if (data.data && data.data.length > 0) {
+        data.data.forEach((item: { url?: string, b64_json?: string }) => {
+          const imageUrl = item.url || item.b64_json
+          if (!imageUrl) {
+            return
+          }
+          const finalUrl = imageUrl.startsWith(`data:`) || imageUrl.startsWith(`http`)
+            ? imageUrl
+            : `data:image/png;base64,${imageUrl}`
+          newImages.push(finalUrl)
+          newPrompts.push(currentPrompt)
+          newTimestamps.push(Date.now())
+        })
+      }
+    }
+
+    if (abortController.value?.signal.aborted && newImages.length === 0) {
+      return
+    }
+
+    if (newImages.length > 0) {
+      generatedImages.value = newImages.concat(generatedImages.value)
+      imagePrompts.value = newPrompts.concat(imagePrompts.value)
+      imageTimestamps.value = newTimestamps.concat(imageTimestamps.value)
+      currentImageIndex.value = 0
+
+      if (requestConfig.useGemini) {
+        const todayKey = getTodayKey()
+        ensureHistoryDate(todayKey)
+        if (selectedDate.value !== todayKey) {
+          selectedDate.value = todayKey
+        }
+      }
+
+      // 非 Gemini 模式限制存储数量，避免占用过多存储空间
+      if (!requestConfig.useGemini && generatedImages.value.length > 20) {
+        generatedImages.value = generatedImages.value.slice(0, 20)
+        imagePrompts.value = imagePrompts.value.slice(0, 20)
+        imageTimestamps.value = imageTimestamps.value.slice(0, 20)
+      }
+
+      await store.setJSON(`ai_generated_images`, generatedImages.value)
+      await store.setJSON(`ai_image_prompts`, imagePrompts.value)
+      await store.setJSON(`ai_image_timestamps`, imageTimestamps.value)
+
+      // 清空输入框
+      prompt.value = ``
     }
     else {
       throw new Error(`未收到有效的图像数据`)
@@ -292,7 +470,17 @@ async function generateImage() {
     }
     else {
       console.error(`图像生成失败:`, e)
-      // 可以在这里添加错误提示
+      const errorMsg = (e as Error).message || `未知错误`
+      // 解析常见错误信息
+      if (errorMsg.includes(`Missing Gemini API key`)) {
+        generateError.value = `缺少 Gemini API Key。请在配置面板中填入 API Key，或在后端设置 GEMINI_API_KEY 环境变量。`
+      }
+      else if (errorMsg.includes(`Ali OSS config missing`)) {
+        generateError.value = `阿里云 OSS 配置不完整。请在图床设置中配置阿里云 OSS。`
+      }
+      else {
+        generateError.value = `生成失败: ${errorMsg}`
+      }
     }
   }
   finally {
@@ -386,32 +574,43 @@ async function regenerateWithPrompt(promptText: string) {
   loading.value = true
   abortController.value = new AbortController()
 
-  const headers: Record<string, string> = { 'Content-Type': `application/json` }
-  if (apiKey.value && type.value !== `default`)
-    headers.Authorization = `Bearer ${apiKey.value}`
+  const requestConfig = resolveImageRequestConfig()
+  if (!requestConfig) {
+    console.error(`图像生成配置不完整`)
+    loading.value = false
+    abortController.value = null
+    return
+  }
 
   try {
-    const url = new URL(endpoint.value)
+    const url = new URL(requestConfig.endpointValue)
     if (!url.pathname.includes(`/images/`) && !url.pathname.endsWith(`/images/generations`)) {
       url.pathname = url.pathname.replace(/\/?$/, `/images/generations`)
     }
 
     const payload: any = {
-      model: model.value,
+      model: requestConfig.modelValue,
       prompt: promptText.trim(),
       size: size.value,
       n: 1,
     }
 
+    if (requestConfig.useGemini) {
+      const ossConfig = await resolveGeminiOssConfig()
+      if (ossConfig) {
+        payload.ossConfig = ossConfig
+      }
+    }
+
     // 只对 DALL-E 模型添加额外参数
-    if (model.value.includes(`dall-e`)) {
+    if (!requestConfig.useGemini && requestConfig.modelValue.includes(`dall-e`)) {
       payload.quality = quality.value
       payload.style = style.value
     }
 
     const res = await window.fetch(url.toString(), {
       method: `POST`,
-      headers,
+      headers: requestConfig.headers,
       body: JSON.stringify(payload),
       signal: abortController.value.signal,
     })
@@ -439,8 +638,16 @@ async function regenerateWithPrompt(promptText: string) {
         imageTimestamps.value.unshift(currentTimestamp) // 保存生成时间戳
         currentImageIndex.value = 0
 
-        // 限制存储的图片数量，避免占用过多存储空间
-        if (generatedImages.value.length > 20) {
+        if (requestConfig.useGemini) {
+          const todayKey = getTodayKey()
+          ensureHistoryDate(todayKey)
+          if (selectedDate.value !== todayKey) {
+            selectedDate.value = todayKey
+          }
+        }
+
+        // 非 Gemini 模式限制存储数量，避免占用过多存储空间
+        if (!requestConfig.useGemini && generatedImages.value.length > 20) {
           generatedImages.value = generatedImages.value.slice(0, 20)
           imagePrompts.value = imagePrompts.value.slice(0, 20)
           imageTimestamps.value = imageTimestamps.value.slice(0, 20)
@@ -470,15 +677,21 @@ async function regenerateWithPrompt(promptText: string) {
 }
 
 /* ---------- 切换图像 ---------- */
-function previousImage() {
+function _previousImage() {
   if (currentImageIndex.value > 0) {
     currentImageIndex.value--
   }
 }
 
-function nextImage() {
+function _nextImage() {
   if (currentImageIndex.value < generatedImages.value.length - 1) {
     currentImageIndex.value++
+  }
+}
+
+function selectImage(index: number) {
+  if (index >= 0 && index < generatedImages.value.length) {
+    currentImageIndex.value = index
   }
 }
 
@@ -545,70 +758,18 @@ function viewFullImage(imageUrl: string) {
 }
 
 /* ---------- 时间相关函数 ---------- */
-const currentTime = ref(Date.now())
-
-// 每秒更新当前时间，用于实时显示剩余时间
-onMounted(() => {
-  const updateTime = () => {
-    currentTime.value = Date.now()
-  }
-
-  // 启动定时器更新时间显示
-  const timeDisplayInterval = setInterval(updateTime, 1000)
-
-  // 组件卸载时清理定时器
-  onBeforeUnmount(() => {
-    clearInterval(timeDisplayInterval)
-  })
-})
-
-function getTimeRemaining(index: number): string {
-  if (!imageTimestamps.value[index]) {
+function formatTimestamp(index: number): string {
+  const timestamp = imageTimestamps.value[index]
+  if (!timestamp) {
     return `未知`
   }
 
-  const EXPIRY_TIME = 60 * 60 * 1000 // 1小时
-  const timestamp = imageTimestamps.value[index]
-  const elapsed = currentTime.value - timestamp
-  const remaining = EXPIRY_TIME - elapsed
-
-  if (remaining <= 0) {
-    return `已过期`
+  const date = new Date(timestamp)
+  if (Number.isNaN(date.getTime())) {
+    return `未知`
   }
 
-  const minutes = Math.floor(remaining / (60 * 1000))
-  const seconds = Math.floor((remaining % (60 * 1000)) / 1000)
-
-  if (minutes > 0) {
-    return `${minutes}分${seconds}秒`
-  }
-  else {
-    return `${seconds}秒`
-  }
-}
-
-function getTimeRemainingClass(index: number): string {
-  if (!imageTimestamps.value[index]) {
-    return `text-muted-foreground`
-  }
-
-  const EXPIRY_TIME = 60 * 60 * 1000 // 1小时
-  const timestamp = imageTimestamps.value[index]
-  const elapsed = currentTime.value - timestamp
-  const remaining = EXPIRY_TIME - elapsed
-
-  if (remaining <= 0) {
-    return `text-red-500 font-medium`
-  }
-  else if (remaining < 10 * 60 * 1000) { // 少于10分钟
-    return `text-orange-500 font-medium`
-  }
-  else if (remaining < 30 * 60 * 1000) { // 少于30分钟
-    return `text-yellow-600`
-  }
-  else {
-    return `text-green-600`
-  }
+  return date.toLocaleString(`zh-CN`, { hour12: false })
 }
 </script>
 
@@ -664,62 +825,123 @@ function getTimeRemainingClass(index: number): string {
         class="mb-4 w-full border rounded-md p-4 max-h-[60vh] overflow-y-auto flex-shrink-0"
       >
         <AIImageConfig @saved="handleConfigSaved" />
+        <div class="my-4 border-t" />
+        <AIImageGeminiConfig @saved="handleConfigSaved" />
       </div>
 
-      <!-- ============ 图像展示区域 ============ -->
-      <div
-        v-if="!configVisible && (loading || generatedImages.length > 0)"
-        class="flex flex-col space-y-4 flex-shrink-0"
-      >
-        <!-- 图像显示 -->
-        <div class="flex items-center justify-center bg-gray-50 dark:bg-gray-800 rounded-lg min-h-[250px] sm:min-h-[300px]">
-          <div v-if="loading" class="flex flex-col items-center gap-4">
-            <Loader2 class="h-8 w-8 animate-spin text-primary" />
-            <p class="text-sm text-muted-foreground">
-              正在生成图像...
-            </p>
-            <Button
-              variant="outline"
-              size="sm"
-              @click="cancelGeneration"
-            >
-              取消生成
-            </Button>
-          </div>
-
-          <div v-else-if="generatedImages.length > 0" class="w-full flex flex-col space-y-3">
-            <!-- 图像导航 -->
-            <div v-if="generatedImages.length > 1" class="flex items-center justify-between p-2 bg-muted/20 rounded">
-              <Button
-                variant="outline"
-                size="sm"
-                :disabled="currentImageIndex <= 0"
-                @click="previousImage"
-              >
-                上一张
-              </Button>
-              <span class="text-sm text-muted-foreground">
-                {{ currentImageIndex + 1 }} / {{ generatedImages.length }}
+      <div v-if="!configVisible" class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]">
+        <!-- 输入区域 -->
+        <div class="rounded-xl border bg-background p-4 shadow-sm">
+          <div class="space-y-3">
+            <div class="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+              <NumberField v-model="generateRounds" :min="1" :max="maxGenerateRounds" class="gap-1">
+                <Label class="text-xs">调用次数</Label>
+                <NumberFieldContent class="w-24">
+                  <NumberFieldDecrement />
+                  <NumberFieldInput />
+                  <NumberFieldIncrement />
+                </NumberFieldContent>
+              </NumberField>
+              <NumberField v-model="imagesPerRound" :min="1" :max="maxImagesPerRound" class="gap-1">
+                <Label class="text-xs">每次生成</Label>
+                <NumberFieldContent class="w-24">
+                  <NumberFieldDecrement />
+                  <NumberFieldInput />
+                  <NumberFieldIncrement />
+                </NumberFieldContent>
+              </NumberField>
+              <span>预计 {{ totalPlannedImages }} 张</span>
+            </div>
+            <div class="rounded-lg border bg-muted/10 p-3">
+              <Label class="text-xs text-muted-foreground">生成描述</Label>
+              <Textarea
+                v-model="prompt"
+                placeholder="描述你想要生成的图像... (Enter 生成，Shift+Enter 换行)"
+                rows="6"
+                class="custom-scroll mt-2 min-h-28 w-full resize-none border-none bg-transparent p-0 text-sm focus-visible:outline-hidden focus:outline-hidden focus-visible:ring-0 focus:ring-0 focus-visible:ring-offset-0 focus:ring-offset-0 focus-visible:ring-transparent focus:ring-transparent"
+                @keydown="handleKeydown"
+              />
+            </div>
+            <div v-if="generateError" class="text-xs text-red-500 bg-red-50 dark:bg-red-950/30 p-2 rounded">
+              {{ generateError }}
+            </div>
+            <div class="flex items-center justify-between">
+              <span class="text-xs text-muted-foreground">
+                {{ loading ? '正在生成，请稍候...' : '支持多轮生成，结果可选一张插入' }}
               </span>
               <Button
-                variant="outline"
-                size="sm"
-                :disabled="currentImageIndex >= generatedImages.length - 1"
-                @click="nextImage"
+                :disabled="!prompt.trim() && !loading"
+                class="min-w-24"
+                @click="loading ? cancelGeneration() : generateImage()"
               >
-                下一张
+                <Loader2 v-if="loading" class="mr-2 h-4 w-4 animate-spin" />
+                <ImageIcon v-else class="mr-2 h-4 w-4" />
+                {{ loading ? '取消' : '生成' }}
               </Button>
             </div>
+          </div>
+        </div>
 
-            <!-- 图像显示 -->
-            <div class="flex items-center justify-center p-2 sm:p-4">
+        <!-- 预览区域 -->
+        <div class="rounded-xl border bg-background p-4 shadow-sm">
+          <div class="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+            <div class="flex items-center gap-2">
+              <span>预览</span>
+              <span v-if="hasImages">{{ currentImageIndex + 1 }} / {{ generatedImages.length }}</span>
+            </div>
+            <div v-if="geminiEnabled" class="flex flex-wrap items-center gap-2">
+              <span>日期</span>
+              <Input
+                v-model="selectedDate"
+                type="date"
+                list="ai-image-history-dates"
+                class="h-7 w-36 text-xs"
+                :disabled="historyLoading"
+              />
+              <Button
+                variant="ghost"
+                size="icon"
+                class="h-7 w-7"
+                :disabled="historyLoading"
+                @click="refreshHistoryDates"
+              >
+                <RefreshCcw class="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          </div>
+          <datalist id="ai-image-history-dates">
+            <option v-for="date in historyDates" :key="date" :value="date" />
+          </datalist>
+          <div v-if="historyError" class="mt-1 text-xs text-red-500">
+            {{ historyError }}
+          </div>
+          <div class="mt-3 flex items-center justify-center rounded-lg bg-gray-50 dark:bg-gray-800 min-h-[260px]">
+            <div v-if="loading" class="flex flex-col items-center gap-4">
+              <Loader2 class="h-8 w-8 animate-spin text-primary" />
+              <p class="text-sm text-muted-foreground">
+                正在生成图像...
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                @click="cancelGeneration"
+              >
+                取消生成
+              </Button>
+            </div>
+            <div v-else-if="historyLoading" class="text-sm text-muted-foreground">
+              正在加载历史图片...
+            </div>
+            <div v-else-if="!hasImages" class="text-sm text-muted-foreground">
+              暂无生成图片
+            </div>
+            <div v-else class="flex items-center justify-center p-2 sm:p-4">
               <div class="relative group cursor-pointer w-full max-w-sm" @click="viewFullImage(generatedImages[currentImageIndex])">
                 <img
                   :src="generatedImages[currentImageIndex]"
                   :alt="`生成的图像 ${currentImageIndex + 1}`"
-                  class="w-full h-auto max-h-[300px] sm:max-h-[350px] object-contain rounded-lg shadow-lg border border-border transition-transform hover:scale-105"
+                  class="w-full h-auto max-h-[300px] object-contain rounded-lg shadow-lg border border-border transition-transform hover:scale-105"
                 >
-                <!-- 点击查看大图提示 -->
                 <div class="absolute inset-0 bg-black/0 group-hover:bg-black/10 rounded-lg flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
                   <div class="bg-black/70 text-white px-3 py-1 rounded-md text-sm">
                     点击查看大图
@@ -727,32 +949,24 @@ function getTimeRemainingClass(index: number): string {
                 </div>
               </div>
             </div>
+          </div>
 
-            <!-- 图像信息 -->
-            <div class="px-2 sm:px-4 py-2 bg-muted/10 rounded space-y-1">
-              <p class="text-xs text-muted-foreground text-center">
-                尺寸: {{ size }}
-              </p>
-              <!-- 提示词 -->
-              <div class="text-xs text-muted-foreground break-words text-center">
-                <span class="font-medium">提示词:</span>
-                <span class="ml-1">{{ imagePrompts[currentImageIndex] || '无关联提示词' }}</span>
-              </div>
-              <div class="text-xs text-muted-foreground text-center">
-                <span class="font-medium">剩余有效期:</span>
-                <span class="ml-1" :class="getTimeRemainingClass(currentImageIndex)">
-                  {{ getTimeRemaining(currentImageIndex) }}
-                </span>
-                <span class="font-medium">，请及时下载保存</span>
-              </div>
+          <div v-if="hasImages" class="mt-3 space-y-3">
+            <div class="text-xs text-muted-foreground">
+              <span class="font-medium">提示词:</span>
+              <span class="ml-1">{{ imagePrompts[currentImageIndex] || '无关联提示词' }}</span>
+            </div>
+            <div class="text-xs text-muted-foreground">
+              <span class="font-medium">生成时间:</span>
+              <span class="ml-1">{{ formatTimestamp(currentImageIndex) }}</span>
             </div>
 
-            <!-- 图像操作按钮 -->
-            <div class="flex flex-wrap justify-center gap-2 p-2 sm:p-4 bg-muted/20 border-t border-border rounded-b-lg">
+            <div class="flex flex-wrap justify-center gap-2 border-t border-border pt-3">
               <Button
                 variant="outline"
                 size="sm"
                 class="flex-shrink-0 bg-background text-xs sm:text-sm"
+                :disabled="!hasImages"
                 @click="insertImageToCursor(generatedImages[currentImageIndex])"
               >
                 <ImageIcon class="h-3 w-3 sm:h-4 sm:w-4 mr-1 sm:mr-2" />
@@ -762,6 +976,7 @@ function getTimeRemainingClass(index: number): string {
                 variant="outline"
                 size="sm"
                 class="flex-shrink-0 bg-background text-xs sm:text-sm"
+                :disabled="!hasImages"
                 @click="downloadImage(generatedImages[currentImageIndex], currentImageIndex)"
               >
                 <Download class="h-3 w-3 sm:h-4 sm:w-4 mr-1 sm:mr-2" />
@@ -771,6 +986,7 @@ function getTimeRemainingClass(index: number): string {
                 variant="outline"
                 size="sm"
                 class="flex-shrink-0 bg-background text-xs sm:text-sm"
+                :disabled="!hasImages"
                 @click="copyImageUrl(generatedImages[currentImageIndex])"
               >
                 <Copy class="h-3 w-3 sm:h-4 sm:w-4 mr-1 sm:mr-2" />
@@ -780,45 +996,32 @@ function getTimeRemainingClass(index: number): string {
                 variant="outline"
                 size="sm"
                 class="flex-shrink-0 bg-background text-xs sm:text-sm"
+                :disabled="!hasImages"
                 @click="regenerateImage"
               >
                 <RefreshCcw class="h-3 w-3 sm:h-4 sm:w-4 mr-1 sm:mr-2" />
                 重新生成
               </Button>
             </div>
+
+            <div class="grid grid-cols-3 gap-2 sm:grid-cols-4">
+              <button
+                v-for="(img, index) in generatedImages"
+                :key="`${img}-${index}`"
+                type="button"
+                class="group relative overflow-hidden rounded-md border transition hover:ring-2 hover:ring-primary"
+                :class="{ 'ring-2 ring-primary': index === currentImageIndex }"
+                @click="selectImage(index)"
+              >
+                <img
+                  :src="img"
+                  :alt="`缩略图 ${index + 1}`"
+                  class="h-20 w-full object-cover"
+                >
+                <div class="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition" />
+              </button>
+            </div>
           </div>
-        </div>
-      </div>
-
-      <!-- ============ 输入框 ============ -->
-      <div v-if="!configVisible" class="relative flex-shrink-0 mt-auto">
-        <div
-          class="bg-background border-border flex flex-col items-baseline gap-2 border rounded-xl px-3 py-2 pr-12 shadow-inner"
-        >
-          <Textarea
-            v-model="prompt"
-            placeholder="描述你想要生成的图像... (Enter 生成，Shift+Enter 换行)"
-            rows="2"
-            class="custom-scroll min-h-16 w-full resize-none border-none bg-transparent p-0 focus-visible:outline-hidden focus:outline-hidden focus-visible:ring-0 focus:ring-0 focus-visible:ring-offset-0 focus:ring-offset-0 focus-visible:ring-transparent focus:ring-transparent"
-            @keydown="handleKeydown"
-          />
-
-          <!-- 生成按钮 -->
-          <Button
-            :disabled="!prompt.trim() && !loading"
-            size="icon"
-            :class="[
-              // eslint-disable-next-line vue/prefer-separate-static-class
-              'absolute bottom-3 right-3 rounded-full disabled:opacity-40',
-              // eslint-disable-next-line vue/prefer-separate-static-class
-              'bg-primary hover:bg-primary/90 text-primary-foreground',
-            ]"
-            :aria-label="loading ? '取消' : '生成'"
-            @click="loading ? cancelGeneration() : generateImage()"
-          >
-            <Loader2 v-if="loading" class="h-4 w-4 animate-spin" />
-            <ImageIcon v-else class="h-4 w-4" />
-          </Button>
         </div>
       </div>
     </DialogContent>

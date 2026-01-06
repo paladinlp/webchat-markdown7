@@ -42,6 +42,20 @@ If you prefer to run `md-cli` on a different port, say `8899`, just specify it l
 md-cli port=8899
 ```
 
+## Gemini Image + Ali OSS
+
+When using the Gemini image generation endpoint (`/images/generations`), the server uploads images to Ali OSS and returns the OSS URL.
+
+Environment variables:
+- `GEMINI_API_KEY`
+- `GEMINI_IMAGE_MODEL` (optional, default: `gemini-3-pro-image-preview`)
+- `ALI_OSS_REGION`
+- `ALI_OSS_BUCKET`
+- `ALI_OSS_ACCESS_KEY_ID`
+- `ALI_OSS_ACCESS_KEY_SECRET`
+- `ALI_OSS_CDN_HOST` (optional)
+- `ALI_OSS_PATH` (optional, default: `ai-images`)
+
 ## Maintainers
 
 - [yanglbme](https://github.com/yanglbme) – Core maintainer.

@@ -37,6 +37,7 @@ const { isDark } = storeToRefs(uiStore)
 const { posts, currentPostIndex } = storeToRefs(postStore)
 const { previewWidth } = storeToRefs(themeStore)
 const {
+  isAIMode,
   isMobile,
   isEditOnLeft,
   isOpenPostSlider,
@@ -108,6 +109,397 @@ const showEditor = ref(true)
 // 切换编辑/预览视图（仅限移动端）
 function toggleView() {
   showEditor.value = !showEditor.value
+}
+
+const aiEntryChoice = ref<'manual' | 'import' | null>(null)
+const importInputRef = ref<HTMLInputElement | null>(null)
+const aiModeBackup = ref<{ postId: string, content: string } | null>(null)
+
+const AI_NEWS_TEMPLATE = `# 请在此输入主标题
+
+## 财经新闻一标题
+![新闻一配图](https://example.com/ai-image-1.png)
+请在此输入新闻一内容。
+
+## 财经新闻二标题
+![新闻二配图](https://example.com/ai-image-2.png)
+请在此输入新闻二内容。
+
+## 财经新闻三标题
+![新闻三配图](https://example.com/ai-image-3.png)
+请在此输入新闻三内容。
+`
+
+const showAIModeSelector = computed(() => isAIMode.value && !aiEntryChoice.value)
+const showAIModeReset = computed(() => isAIMode.value && aiEntryChoice.value != null)
+
+watch(
+  isAIMode,
+  (value) => {
+    aiEntryChoice.value = null
+    if (value) {
+      backupOriginalContent()
+    }
+    else {
+      restoreOriginalContent()
+    }
+  },
+  { immediate: true },
+)
+
+function enterManualMode() {
+  aiEntryChoice.value = 'manual'
+  applyEditorContent(AI_NEWS_TEMPLATE)
+}
+
+function resetAIModeEntry() {
+  aiEntryChoice.value = null
+}
+
+function getCurrentContent() {
+  if (editor.value) {
+    return editorStore.getContent()
+  }
+
+  return posts.value[currentPostIndex.value]?.content ?? ``
+}
+
+function applyEditorContent(content: string) {
+  if (editor.value) {
+    editorStore.importContent(content)
+    editorRefresh()
+    return
+  }
+
+  const currentPost = posts.value[currentPostIndex.value]
+  if (currentPost) {
+    postStore.updatePostContent(currentPost.id, content)
+  }
+}
+
+function backupOriginalContent() {
+  if (aiModeBackup.value) {
+    return
+  }
+
+  const currentPost = posts.value[currentPostIndex.value]
+  if (!currentPost) {
+    return
+  }
+
+  aiModeBackup.value = {
+    postId: currentPost.id,
+    content: getCurrentContent(),
+  }
+}
+
+function restoreOriginalContent() {
+  if (!aiModeBackup.value) {
+    return
+  }
+
+  const { postId, content } = aiModeBackup.value
+  postStore.updatePostContent(postId, content)
+
+  if (posts.value[currentPostIndex.value]?.id === postId && editor.value) {
+    editorStore.importContent(content)
+    editorRefresh()
+  }
+
+  aiModeBackup.value = null
+}
+
+function triggerImport() {
+  importInputRef.value?.click()
+}
+
+function stripBom(text: string) {
+  return text.replace(/^\uFEFF/, ``)
+}
+
+function safeParseJson(text: string) {
+  try {
+    return JSON.parse(text)
+  }
+  catch {
+    return null
+  }
+}
+
+function extractJsonCandidate(text: string) {
+  const objectStart = text.indexOf(`{`)
+  const objectEnd = text.lastIndexOf(`}`)
+  const arrayStart = text.indexOf(`[`)
+  const arrayEnd = text.lastIndexOf(`]`)
+
+  let start = -1
+  let end = -1
+
+  if (objectStart !== -1 && objectEnd > objectStart) {
+    start = objectStart
+    end = objectEnd
+  }
+
+  if (arrayStart !== -1 && arrayEnd > arrayStart) {
+    if (start === -1 || arrayStart < start) {
+      start = arrayStart
+      end = arrayEnd
+    }
+  }
+
+  if (start === -1 || end === -1) {
+    return null
+  }
+
+  return text.slice(start, end + 1)
+}
+
+function sanitizeLooseJson(raw: string) {
+  let result = ``
+  let inString = false
+  let escaped = false
+
+  for (let i = 0; i < raw.length; i++) {
+    const char = raw[i]
+
+    if (!inString) {
+      if (char === `"`) {
+        inString = true
+      }
+      result += char
+      continue
+    }
+
+    if (escaped) {
+      escaped = false
+      result += char
+      continue
+    }
+
+    if (char === `\\`) {
+      escaped = true
+      result += char
+      continue
+    }
+
+    if (char === `"`) {
+      let j = i + 1
+      while (j < raw.length && /\s/.test(raw[j])) {
+        j++
+      }
+      const next = raw[j]
+      if (next === `,` || next === `}` || next === `]` || next === `:`) {
+        inString = false
+        result += char
+      }
+      else {
+        result += `\\\"`
+      }
+      continue
+    }
+
+    result += char
+  }
+
+  return result
+}
+
+function toDemoImageUrl(path: string) {
+  const trimmed = path.trim()
+  if (!trimmed) {
+    return ``
+  }
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed
+  }
+  return `https://example.com/${trimmed.replace(/^\.?\//, ``)}`
+}
+
+function extractProgramName(text: string) {
+  const match = text.match(/《([^》]+)》/)
+  return match ? match[1] : `财经新闻`
+}
+
+function findNewsPayload(value: unknown): Record<string, any> | null {
+  if (!value) {
+    return null
+  }
+
+  if (Array.isArray(value)) {
+    if (value.every(item => item && typeof item === `object`)) {
+      return { news: value }
+    }
+    for (const item of value) {
+      const found = findNewsPayload(item)
+      if (found) {
+        return found
+      }
+    }
+    return null
+  }
+
+  if (typeof value === `object`) {
+    const obj = value as Record<string, any>
+    if (Array.isArray(obj.news)) {
+      return obj
+    }
+    for (const key of Object.keys(obj)) {
+      const found = findNewsPayload(obj[key])
+      if (found) {
+        return found
+      }
+    }
+  }
+
+  return null
+}
+
+function buildNewsMarkdown(payload: Record<string, any>) {
+  if (!Array.isArray(payload.news)) {
+    return ``
+  }
+
+  const sections: string[] = []
+  const welcomeText = payload.welcomeText ? String(payload.welcomeText).trim() : ``
+  const programName = welcomeText ? extractProgramName(welcomeText) : `财经新闻`
+  const titleParts = [programName, payload.date].filter(Boolean)
+  if (titleParts.length) {
+    sections.push(`# ${titleParts.join(` | `)}`)
+  }
+  if (payload.host) {
+    sections.push(`> 主播：${String(payload.host).trim()}`)
+  }
+  if (welcomeText) {
+    sections.push(`> ${welcomeText}`)
+  }
+
+  const headlineLines = payload.news.map((item: Record<string, any>, index: number) => {
+    const label = item?.category ? String(item.category).trim() : `新闻 ${index + 1}`
+    const emoji = item?.emoji ? String(item.emoji).trim() : ``
+    return `- ${emoji ? `${emoji} ` : ``}${label}`
+  })
+  if (headlineLines.length) {
+    sections.push(`## 今日要闻`)
+    sections.push(headlineLines.join(`\n`))
+  }
+
+  payload.news.forEach((item: Record<string, any>, index: number) => {
+    if (!item) {
+      return
+    }
+    const headingParts = [item.emoji, item.category].filter(Boolean).join(` `).trim()
+    const heading = headingParts ? `### ${headingParts}` : `### 新闻 ${index + 1}`
+    const blockParts = [heading]
+
+    if (item.content) {
+      blockParts.push(String(item.content).trim())
+    }
+
+    const imageUrl = item.imagePath ? toDemoImageUrl(String(item.imagePath)) : ``
+    if (imageUrl) {
+      const alt = item.category ? String(item.category).trim() : `新闻图片`
+      blockParts.push(`![${alt}](${imageUrl})`)
+    }
+
+    sections.push(blockParts.join(`\n\n`))
+  })
+
+  return `${sections.join(`\n\n`).trim()}\n`
+}
+
+function normalizeImportToMarkdown(raw: string) {
+  const trimmed = stripBom(raw).trim()
+  if (!trimmed) {
+    return ``
+  }
+
+  const parsed = safeParseJson(trimmed)
+  const parsedPayload = findNewsPayload(parsed)
+  if (parsedPayload) {
+    const markdown = buildNewsMarkdown(parsedPayload)
+    if (markdown) {
+      return markdown
+    }
+  }
+
+  const sanitizedParsed = safeParseJson(sanitizeLooseJson(trimmed))
+  const sanitizedPayload = findNewsPayload(sanitizedParsed)
+  if (sanitizedPayload) {
+    const markdown = buildNewsMarkdown(sanitizedPayload)
+    if (markdown) {
+      return markdown
+    }
+  }
+
+  const extracted = extractJsonCandidate(trimmed)
+  if (extracted) {
+    const extractedParsed = safeParseJson(extracted)
+    const extractedPayload = findNewsPayload(extractedParsed)
+    if (extractedPayload) {
+      const markdown = buildNewsMarkdown(extractedPayload)
+      if (markdown) {
+        return markdown
+      }
+    }
+  }
+
+  if (extracted) {
+    const sanitizedExtracted = safeParseJson(sanitizeLooseJson(extracted))
+    const sanitizedExtractedPayload = findNewsPayload(sanitizedExtracted)
+    if (sanitizedExtractedPayload) {
+      const markdown = buildNewsMarkdown(sanitizedExtractedPayload)
+      if (markdown) {
+        return markdown
+      }
+    }
+  }
+
+  if (typeof parsed === `string`) {
+    const nested = safeParseJson(parsed)
+    const nestedPayload = findNewsPayload(nested)
+    if (nestedPayload) {
+      const markdown = buildNewsMarkdown(nestedPayload)
+      if (markdown) {
+        return markdown
+      }
+    }
+  }
+
+  return `# 导入内容\n\n${trimmed}\n`
+}
+
+function applyImportedMarkdown(content: string) {
+  if (!content) {
+    toast.error(`导入内容为空`)
+    return
+  }
+
+  applyEditorContent(content)
+}
+
+async function handleImportChange(event: Event) {
+  const target = event.target as HTMLInputElement | null
+  const file = target?.files?.[0]
+  if (!file) {
+    return
+  }
+
+  try {
+    const raw = await file.text()
+    const markdown = normalizeImportToMarkdown(raw)
+    applyImportedMarkdown(markdown)
+    aiEntryChoice.value = 'import'
+    toast.success(`已导入并转换为 Markdown`)
+  }
+  catch (error) {
+    console.error(error)
+    toast.error(`导入失败，请检查文件内容`)
+  }
+  finally {
+    if (target) {
+      target.value = ``
+    }
+  }
 }
 
 // AI 工具箱已移到侧边栏
@@ -681,8 +1073,50 @@ onUnmounted(() => {
 
     <main class="container-main flex flex-1 flex-col">
       <div
+        v-if="showAIModeSelector"
+        class="flex flex-1 items-center justify-center"
+      >
+        <div class="mx-4 w-full max-w-xl rounded-xl border bg-background p-8 shadow-sm">
+          <div class="text-center">
+            <h2 class="text-xl font-semibold">
+              AI 模式入口
+            </h2>
+            <p class="mt-2 text-sm text-muted-foreground">
+              请选择编辑方式：手动编辑或导入文件。
+            </p>
+          </div>
+          <div class="mt-6 grid gap-4 sm:grid-cols-2">
+            <Button class="h-12" @click="enterManualMode">
+              手动编辑
+            </Button>
+            <Button class="h-12" variant="outline" @click="triggerImport">
+              导入文件
+            </Button>
+          </div>
+          <input
+            ref="importInputRef"
+            type="file"
+            accept=".txt"
+            class="hidden"
+            @change="handleImportChange"
+          >
+        </div>
+      </div>
+
+      <div
+        v-show="!showAIModeSelector"
         class="container-main-section border-radius-10 relative flex flex-1 overflow-hidden border"
       >
+        <Button
+          v-if="showAIModeReset"
+          variant="outline"
+          size="sm"
+          class="absolute right-3 top-3 z-20"
+          @click="resetAIModeEntry"
+        >
+          返回选择
+        </Button>
+
         <ResizablePanelGroup direction="horizontal">
           <ResizablePanel
             :default-size="15"
@@ -763,7 +1197,7 @@ onUnmounted(() => {
       </div>
 
       <!-- 移动端浮动按钮组 -->
-      <div v-if="isMobile" class="fixed bottom-16 right-6 z-50 flex flex-col gap-2">
+      <div v-if="isMobile && !showAIModeSelector" class="fixed bottom-16 right-6 z-50 flex flex-col gap-2">
         <!-- 切换编辑/预览按钮 -->
         <button
           class="bg-primary flex items-center justify-center rounded-full p-3 text-white shadow-lg transition active:scale-95 hover:scale-105 dark:bg-gray-700 dark:text-white dark:ring-2 dark:ring-white/30"

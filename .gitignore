@@ -22,6 +22,8 @@ dist
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+.md-dev.log
+.md-cli.log
 
 # Editor directories and files
 .idea
@@ -37,6 +39,7 @@ httpData
 public/upload/**
 !public/upload/*.gitkeep
 .history
+packages/md-cli/data/**
 
 # Package manager lock file
 package-lock.json

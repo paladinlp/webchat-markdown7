@@ -11,8 +11,10 @@ const editorStore = useEditorStore()
 const postStore = usePostStore()
 const exportStore = useExportStore()
 const uiStore = useUIStore()
+const { isAIMode } = storeToRefs(uiStore)
 
 const {
+  toggleAIImageDialog,
   toggleShowInsertFormDialog,
   toggleShowInsertMpCardDialog,
   toggleShowUploadImgDialog,
@@ -83,6 +85,9 @@ function downloadAsCardImage() {
     <ContextMenuContent class="w-64">
       <ContextMenuItem inset @click="toggleShowUploadImgDialog()">
         上传图片
+      </ContextMenuItem>
+      <ContextMenuItem v-if="isAIMode" inset @click="toggleAIImageDialog(true)">
+        AI 插图
       </ContextMenuItem>
       <ContextMenuItem inset @click="toggleShowInsertFormDialog()">
         插入表格

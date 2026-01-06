@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Copy, Menu, Palette } from 'lucide-vue-next'
+import { Copy, Menu, Palette, Sparkles } from 'lucide-vue-next'
 import { useEditorStore } from '@/stores/editor'
 import { useExportStore } from '@/stores/export'
 import { useRenderStore } from '@/stores/render'
@@ -26,7 +26,7 @@ const exportStore = useExportStore()
 const { editor } = storeToRefs(editorStore)
 const { output } = storeToRefs(renderStore)
 const { primaryColor } = storeToRefs(themeStore)
-const { isOpenRightSlider } = storeToRefs(uiStore)
+const { isOpenRightSlider, isAIMode } = storeToRefs(uiStore)
 
 // Editor refresh function
 function editorRefresh() {
@@ -280,6 +280,12 @@ function copyToWeChat() {
 
     <!-- 右侧操作区 -->
     <div class="flex flex-wrap items-center gap-2">
+      <div class="flex items-center gap-2 rounded-md border px-2 py-1">
+        <Sparkles class="h-4 w-4 text-muted-foreground" />
+        <span class="text-xs text-muted-foreground">是否进入AI模式</span>
+        <Switch v-model:checked="isAIMode" />
+      </div>
+
       <!-- 复制按钮 -->
       <Button
         variant="outline"
